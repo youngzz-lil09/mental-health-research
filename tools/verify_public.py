@@ -22,7 +22,7 @@ def check_tree(value, path='root', details=False):
 
 
 def verify():
-    for name in ['index.html','.nojekyll','.gitignore','README.md','THIRD_PARTY_NOTICES.md','assets/site.css','assets/app.js','assets/vendor/plotly.min.js','data/manifest.json']:
+    for name in ['index.html','privacy.html','.nojekyll','.gitignore','README.md','THIRD_PARTY_NOTICES.md','assets/site.css','assets/app.js','assets/vendor/plotly.min.js','data/manifest.json']:
         assert (ROOT/name).is_file(), 'Missing '+name
     paths=list((ROOT/'data').glob('*.json'))
     for path in paths:
