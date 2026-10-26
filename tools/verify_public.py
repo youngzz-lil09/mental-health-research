@@ -57,12 +57,19 @@ def verify():
                                 assert abs(sum(r['ratio'] for r in rows)-1)<1e-8
                                 assert sum(r['count'] for r in rows)==rows[0]['total']
     users=json.loads((ROOT/'data/users.json').read_text(encoding='utf-8'))
-    assert users['count']==749 and users['post_count']==18207
-    assert sum(r['count'] for r in users['map_cells'])==749
+    assert users['count']==1137 and users['post_count']==30813
+    assert users['panel_count']==1200 and users['pending_count']==63
+    assert users['panel_count']==users['count']+users['pending_count']
+    assert users['formal_count']==813 and users['low_information_count']==324
+    assert users['priorities']=={'常规关注':1130,'建议复核':3,'优先复核':4}
+    assert sum(r['count'] for r in users['map_cells'])==users['count']
+    assert sum(r['model_scored_post_count'] for r in users['weeks'])==users['post_count']
+    assert sum(r['model_scored_post_count'] for r in users['snapshots'])==users['post_count']
+    assert len(users['weeks'])==147 and len(users['snapshots'])==9
     assert users['approved_cases']==[]
     user_rows=json.loads((ROOT/'data'/manifest['users']['cases_file']).read_text(encoding='utf-8'))['rows']
-    assert len(user_rows)==749 and len({r['id'] for r in user_rows})==749
-    assert sum(r['post_count'] for r in user_rows)==18207
+    assert len(user_rows)==users['count'] and len({r['id'] for r in user_rows})==users['count']
+    assert sum(r['post_count'] for r in user_rows)==users['post_count']
     post_chunks={name:json.loads((ROOT/'data'/name).read_text(encoding='utf-8')) for name in {r['posts_file'] for r in user_rows}}
     for row in user_rows:
         assert re.fullmatch(r'U\d{4}',row['id']) and len(row['dimensions'])==9
@@ -72,7 +79,10 @@ def verify():
         assert len({p['id'] for p in posts})==len(posts)
         for dim in row['dimensions']:
             assert 0<=dim['probability']<=1 and 0<=dim['threshold']<=1 and dim['label'] in (0,1)
-    assert manifest['approved_case_count']==749+sum(sum(e['counts'].values()) for e in manifest['events'])
+    assert set(p.name for p in (ROOT/'data').glob('user-posts-*.json'))==set(post_chunks)
+    assert manifest['users']['count']==users['count']
+    assert manifest['users']['post_count']==users['post_count']
+    assert manifest['approved_case_count']==users['count']+sum(sum(e['counts'].values()) for e in manifest['events'])
     geo=json.loads((ROOT/'data/provinces.json').read_text(encoding='utf-8'))
     assert len({f['properties']['name'] for f in geo['features'] if f['properties']['name']})==34
     perf=json.loads((ROOT/'data/performance.json').read_text(encoding='utf-8'))

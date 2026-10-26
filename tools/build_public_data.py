@@ -28,6 +28,15 @@ def export(source, output):
     import analysis as a
     import handoff_ui as hot
     from build_handoff import public_text
+    existing = output / 'data' / 'manifest.json'
+    if existing.exists():
+        current = json.loads(existing.read_text(encoding='utf-8')).get('users', {})
+        if current.get('version') and not (a.USER_RESULT / 'frontend_manifest.json').exists():
+            raise ValueError('Use --users-snapshot with the reviewed current user data.')
+        if current.get('version'):
+            source_info = a.load_json(a.USER_RESULT / 'frontend_manifest.json')
+            if source_info.get('snapshot_at', '') < current['version']:
+                raise ValueError('The source user snapshot is older than the public data. Use --users-snapshot with the latest snapshot.')
     output.mkdir(parents=True, exist_ok=True)
     data = output / 'data'
     data.mkdir(exist_ok=True)
@@ -259,9 +268,126 @@ def export(source, output):
     print('PUBLIC_EXPORT_OK',len(users),'users',int(users.post_count.sum()),'posts; reviewed records:',manifest['approved_case_count'])
 
 
+def export_user_snapshot(snapshot, output):
+    """Refresh public user data only; keep unrelated research results unchanged."""
+    import csv
+    from collections import Counter, defaultdict
+
+    def read(name):
+        with (snapshot / name).open(encoding='utf-8-sig', newline='') as handle:
+            return list(csv.DictReader(handle))
+
+    def number(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError('Non-finite number in user snapshot')
+        return result
+
+    def text(value):
+        value = str(value or '')
+        value = re.sub(r'https?://\S+|www\.\S+', '[链接已隐藏]', value)
+        value = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[邮箱已隐藏]', value)
+        value = re.sub(r'@[\w\u4e00-\u9fff_-]+', '[账号提及已隐藏]', value)
+        value = re.sub(r'(?<!\d)1[3-9]\d{9}(?!\d)', '[号码已隐藏]', value)
+        value = re.sub(r'(?<!\w)\d{17}[\dXx](?!\w)', '[证件号已隐藏]', value)
+        return re.sub(r'(?<!\w)(?:[A-Za-z]:[\\/]|/Users/|/home/)[^\s，。；]+', '[路径已隐藏]', value)
+
+    data = output / 'data'
+    manifest = json.loads((data / 'manifest.json').read_text(encoding='utf-8'))
+    source_manifest = json.loads((snapshot / 'frontend_manifest.json').read_text(encoding='utf-8'))
+    users = read('frontend_user_predictions.csv')
+    posts = read('frontend_user_posts.csv')
+    registry = read('frontend_user_registry.csv')
+    explanations = {row['account_id']: row for row in read('frontend_user_explanations.csv')}
+    identities = {row['account_id'] for row in users}
+    assert len(identities) == len(users) == source_manifest['users']
+    assert len(registry) == source_manifest['panel_users']
+    assert sum(row['analysis_status'] == '已分析' for row in registry) == len(users)
+    assert identities == set(explanations)
+    groups = defaultdict(list)
+    for post in posts:
+        assert post['account_id'] in identities
+        groups[post['account_id']].append(post)
+    assert len(posts) == len({post['post_id'] for post in posts}) == source_manifest['posts']
+    cells = Counter((text(u['profile_gender']) or '未知', text(u['ip_region']) or '未知', u['review_priority']) for u in users)
+    dimensions = []
+    for row in read('frontend_dimension_summary.csv'):
+        code = row['dimension']
+        dimensions.append({'dimension': code,
+            'name': next(d['name'] for d in manifest['dimensions'] if d['code'] == code),
+            **{key: number(row[key]) for key in ('positive_users','positive_rate','mean_probability','median_probability')}})
+    snapshots = [{key: row[key] if key == 'snapshot_time_shanghai' else int(row[key])
+        for key in ('snapshot_time_shanghai','model_scored_post_count','model_scored_user_count')}
+        for row in read('temporal/snapshot_activity_trend.csv')]
+    weeks = []
+    for row in read('temporal/publication_week_model_trend.csv'):
+        item = {key: row[key] for key in ('week_start','week_end')}
+        item['is_partial_week'] = row['is_partial_week'].lower() == 'true'
+        for key in ('model_scored_post_count','model_scored_user_count'):
+            item[key] = int(row[key])
+        for n in range(1,10):
+            for suffix in ('mean_probability','positive_rate'):
+                key = f'P{n}_{suffix}'
+                item[key] = number(row[key])
+        weeks.append(item)
+    assert sum(row['model_scored_post_count'] for row in weeks) == len(posts)
+    assert sum(row['model_scored_post_count'] for row in snapshots) == len(posts)
+    priorities = dict(Counter(u['review_priority'] for u in users))
+    common = {'count': len(users), 'post_count': len(posts),
+        'panel_count': len(registry), 'pending_count': len(registry)-len(users),
+        'version': source_manifest['snapshot_at'], 'model': 'RoBERTa seed2026',
+        'coverage': sum(number(u['text_coverage_ratio']) for u in users)/len(users),
+        'priorities': priorities}
+    user_out = {**common, 'eligibility': dict(Counter(u['analysis_eligibility'] for u in users)),
+        'formal_count': sum(int(u['post_count']) >= 20 for u in users),
+        'low_information_count': sum(10 <= int(u['post_count']) <= 19 for u in users),
+        'dimensions': dimensions, 'snapshots': snapshots, 'weeks': weeks,
+        'map_cells': [{'gender': gender,'region': region,'priority': priority,'count': count}
+                      for (gender,region,priority),count in sorted(cells.items())], 'approved_cases': []}
+    chunks, details = {}, []
+    for index, user in enumerate(sorted(users, key=lambda row: row['account_id'])):
+        alias = f'U{index+1:04d}'
+        chunk_name = f'user-posts-{index//100+1}.json'
+        own = groups[user['account_id']]
+        assert len(own) == int(user['post_count'])
+        chunks.setdefault(chunk_name, {'users': {}})['users'][alias] = [
+            {'id': alias+f'-P{n+1:03d}', 'date': text(post['published_at_raw']).lstrip("'"),
+             'text': text(post['text']), **{key: int(float(post[field] or 0)) for key,field in
+                (('likes','like_count'),('replies','comment_count'),('reposts','repost_count'))}}
+            for n,post in enumerate(own)]
+        explanation = explanations[user['account_id']]
+        dims = [{'code': d['code'],'name': d['name'],
+                 'probability': number(user[f'p{n}_probability']),
+                 'threshold': number(user[f'p{n}_threshold']), 'label': int(user[f'p{n}_label'])}
+                for n,d in enumerate(manifest['dimensions'],1)]
+        assert all(d['label'] == int(d['probability'] >= d['threshold']) for d in dims)
+        details.append({'id': alias, 'post_count': len(own), 'gender': text(user['profile_gender']),
+            'region': text(user['ip_region']), 'score': number(user['continuous_review_score']),
+            'positive_count': int(user['positive_dimension_count']), 'priority': user['review_priority'],
+            'coverage': number(user['text_coverage_ratio']), 'windows': int(user['window_count']),
+            'eligibility': text(user['analysis_eligibility']), 'model': 'RoBERTa seed2026',
+            'dimensions': dims, 'posts_file': chunk_name, 'keywords': text(explanation['keywords']),
+            'evidence': [text(explanation[f'evidence_{n}']) for n in range(1,5) if explanation[f'evidence_{n}']]})
+    manifest['users'] = {**common, 'cases_file': 'users-cases.json'}
+    manifest['approved_case_count'] = len(users) + sum(sum(e['counts'].values()) for e in manifest['events'])
+    payloads = {'manifest.json': manifest, 'users.json': user_out, 'users-cases.json': {'rows': details}, **chunks}
+    # Validate the entire in-memory export before replacing output files.
+    assert sum(len(p['users'][key]) for p in chunks.values() for key in p['users']) == len(posts)
+    for name,obj in payloads.items():
+        (data / name).write_text(json.dumps(obj,ensure_ascii=False,separators=(',', ':'),allow_nan=False),encoding='utf-8')
+    for stale in data.glob('user-posts-*.json'):
+        if stale.name not in chunks:
+            stale.unlink()
+    print('PUBLIC_USER_EXPORT_OK',len(users),'users;',len(posts),'posts;',common['pending_count'],'pending users (count only)')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[2]/'app')
     parser.add_argument('--output', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--users-snapshot', type=Path, help='Export only the specified reviewed user snapshot')
     args = parser.parse_args()
-    export(args.source.resolve(), args.output.resolve())
+    if args.users_snapshot:
+        export_user_snapshot(args.users_snapshot.resolve(), args.output.resolve())
+    else:
+        export(args.source.resolve(), args.output.resolve())
